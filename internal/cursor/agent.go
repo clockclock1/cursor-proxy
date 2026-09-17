@@ -342,14 +342,22 @@ const (
 	smToolInputDelta   = 15 // 参数流式片段：{ 1: 调用 id, 2{3{1: 文本片段}} }
 )
 
-// finish 统一收尾：先把「宣告了却没完成」的工具调用交代清楚，再结束本轮。
+// finish 统一收尾：先补齐写文件调用，再把「宣告了却没完成」的交代清楚。
 //
-// 上游偶尔会发一个「进行中」帧宣告要用某工具，然后既不发参数也不发完成帧
-// （实测 web_search 就是这样，参数长度 0，两次都没有下文）。此时客户端只会
-// 收到模型那句「我这就去搜索…」，然后流就正常结束了——看起来像模型自己
-// 说完了，其实是这一轮没做完。宁可多一句说明，也不要静默。
+// 写文件与其它工具不同：内容靠 sm.15 分片下发，完成帧里的 stream_content
+// （字段 6）经常是空的，甚至有的模型只宣告 + 流式片段、不发完成帧。
+// 其它工具（读/跑命令/搜索）参数都在完成帧里一次给齐，所以表现为
+// 「别的工具都正常，就写入不行」。收尾前必须把已攒齐的片段合成调用。
+//
+// 其余工具偶尔只发「进行中」帧然后既不发参数也不发完成帧（实测 web_search
+// 就是这样）。此时客户端只会收到模型那句「我这就去搜索…」然后流正常结束——
+// 看起来像说完了，其实没做完。宁可多一句说明，也不要静默。
 func (s *agentStreamState) finish(send func(StreamEvent) bool, truncated bool) {
 	if s.errored {
+		return
+	}
+
+	if !s.flushStreamedWrites(send) {
 		return
 	}
 
@@ -379,6 +387,80 @@ func (s *agentStreamState) finish(send func(StreamEvent) bool, truncated bool) {
 		}
 	}
 	send(StreamEvent{Kind: EventEnd, Truncated: truncated})
+}
+
+// flushStreamedWrites 把「已流式收到内容、却没下发完成帧」的写文件调用补发出去。
+// 返回 false 表示下游已断开，调用方应立刻停止。
+func (s *agentStreamState) flushStreamedWrites(send func(StreamEvent) bool) bool {
+	for id, name := range s.announced {
+		if s.emitted[id] {
+			continue
+		}
+		kind := s.toolKind[id]
+		if kind != ToolWriteFile && name != "edit" {
+			continue
+		}
+		content := s.inputBuf[id]
+		if content == "" {
+			continue
+		}
+		call := &NativeToolCall{
+			ID: id, Kind: ToolWriteFile, Path: s.toolPath[id],
+			Content: content, Name: "edit", Field: toolWriteFile,
+		}
+		if s.emitted == nil {
+			s.emitted = map[string]bool{}
+		}
+		s.emitted[id] = true
+		s.sawToolCall = true
+		log.Printf("[cursor] 写文件调用 %s 未收到完成帧，已用 %d 字节流式内容补齐", id, len(content))
+		if !send(StreamEvent{Kind: EventToolCall, Tool: call}) {
+			return false
+		}
+	}
+	return true
+}
+
+// appendInput 攒起写文件等内容的流式片段，供完成帧缺内容时回填。
+func (s *agentStreamState) appendInput(id, text string) {
+	if id == "" || text == "" {
+		return
+	}
+	if s.inputBuf == nil {
+		s.inputBuf = map[string]string{}
+	}
+	s.inputBuf[id] += text
+}
+
+// enrichWriteCall 用进行中帧的路径与流式片段，补全写文件调用。
+//
+// EditArgs.stream_content 是 Optional：完成帧经常只有路径。Cursor 本机客户端
+// 自己攒 sm.15，代理若只看完成帧就会把空内容桥接出去。
+func (s *agentStreamState) enrichWriteCall(call *NativeToolCall) {
+	if call == nil {
+		return
+	}
+	if call.Path == "" {
+		call.Path = s.toolPath[call.ID]
+	}
+	buf := s.inputBuf[call.ID]
+
+	// 完成帧参数不完整时会退化成 Unknown；若进行中帧已标明是写文件，升回去
+	if call.Kind == ToolUnknown && (call.Name == "edit" || s.toolKind[call.ID] == ToolWriteFile) {
+		if call.Path != "" || buf != "" || call.Content != "" {
+			call.Kind = ToolWriteFile
+			call.Field = toolWriteFile
+			if call.Name == "" {
+				call.Name = "edit"
+			}
+		}
+	}
+	if call.Kind != ToolWriteFile {
+		return
+	}
+	if buf != "" && (call.Content == "" || len(buf) > len(call.Content)) {
+		call.Content = buf
+	}
 }
 
 // parseToolProgress 从「进行中」帧里取出调用 id、工具类型与已知路径。
@@ -592,11 +674,14 @@ func firstToolField(w map[int][]proto.Field) (int, []byte) {
 // 其余的走未识别分支，靠 toolNames 报出名字即可。
 var toolParsers = map[int]func(a map[int][]proto.Field) *NativeToolCall{
 	toolWriteFile: func(a map[int][]proto.Field) *NativeToolCall {
+		// EditArgs：1=路径，6=stream_content（Optional，常空，正文多在 sm.15）。
+		// 路径也可能稍晚才到，缺路径但有内容时仍要认出来，路径由进行中帧补。
 		path := proto.FirstString(a, 1)
-		if path == "" {
+		content := proto.FirstString(a, 6)
+		if path == "" && content == "" {
 			return nil
 		}
-		return &NativeToolCall{Kind: ToolWriteFile, Path: path, Content: proto.FirstString(a, 6)}
+		return &NativeToolCall{Kind: ToolWriteFile, Path: path, Content: content}
 	},
 	toolReadFile: func(a map[int][]proto.Field) *NativeToolCall {
 		if path := proto.FirstString(a, 1); path != "" {
@@ -776,6 +861,9 @@ type agentStreamState struct {
 	// 「进行中」帧先于参数片段到达，据此判断片段要不要转发。
 	toolKind map[string]NativeToolKind
 	toolPath map[string]string
+	// inputBuf 按调用 id 攒 sm.15 流式片段。写文件的正文主要靠这些片段，
+	// 完成帧里的字段 6 经常为空，必须在这里拼回完整内容再桥接。
+	inputBuf map[string]string
 }
 
 // process 消费缓冲里完整的帧，返回是否遇到协议级结束帧。
@@ -855,6 +943,7 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 			// 参数流式片段
 			if id, text, ok := parseToolInputDelta(smFields); ok {
 				if text != "" {
+					s.appendInput(id, text)
 					send(StreamEvent{
 						Kind: EventToolInputDelta,
 						Text: text,
@@ -866,6 +955,7 @@ func (s *agentStreamState) process(buffer *[]byte, send func(StreamEvent) bool) 
 
 			// 内置工具调用：参数完整的「调用完成」帧
 			if call := parseNativeToolCall(smFields); call != nil && !s.emitted[call.ID] {
+				s.enrichWriteCall(call)
 				if s.emitted == nil {
 					s.emitted = map[string]bool{}
 				}

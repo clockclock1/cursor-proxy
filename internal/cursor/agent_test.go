@@ -919,11 +919,88 @@ func TestIncompleteArgsStillReportsCall(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("完成帧到了就该下发一次调用，实际 %d 次", len(calls))
 	}
-	if calls[0].Name != "edit" {
-		t.Fatalf("应带上上游的规范名便于排查，实际 %q", calls[0].Name)
+	if calls[0].Kind != ToolWriteFile || calls[0].Content != "只有内容没有路径" {
+		t.Fatalf("缺路径但仍应识别为写文件并保住内容：%+v", calls[0])
 	}
 	if strings.Contains(text, "没有给出参数") {
 		t.Fatalf("调用已下发就不该再插说明：%q", text)
+	}
+}
+
+// 完成帧里 stream_content 为空时，必须用 sm.15 片段拼回正文。
+// 否则桥接出去的 write 没有 content——读/跑命令仍正常，只表现为写入坏了。
+func TestWriteContentFilledFromInputDeltas(t *testing.T) {
+	args := proto.NewWriter()
+	args.Str(1, "/tmp/hello.py")
+	// 故意不写字段 6：模拟 EditArgs.stream_content 未设置
+
+	var data []byte
+	data = append(data, progressFrame("call-1", toolWriteFile, "/tmp/hello.py")...)
+	data = append(data, inputDeltaFrame("call-1", "print(")...)
+	data = append(data, inputDeltaFrame("call-1", "\"hi\")\n")...)
+	data = append(data, toolCallFrame("call-1", toolWriteFile, args)...)
+	data = append(data, conversationFrame(4)...)
+
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "test-model")
+
+	var calls []NativeToolCall
+	for ev := range events {
+		if ev.Kind == EventToolCall && ev.Tool != nil {
+			calls = append(calls, *ev.Tool)
+		}
+	}
+	if len(calls) != 1 {
+		t.Fatalf("应下发 1 次写文件，实际 %d", len(calls))
+	}
+	c := calls[0]
+	if c.Kind != ToolWriteFile || c.Path != "/tmp/hello.py" {
+		t.Fatalf("类型/路径不对：%+v", c)
+	}
+	if c.Content != "print(\"hi\")\n" {
+		t.Fatalf("应从流式片段拼回内容，得到 %q", c.Content)
+	}
+}
+
+// 有的模型（尤其 default/auto）只宣告写文件并流式下发内容，不发完成帧。
+// 即便中间夹了「我这就去创建…」这类正文，收尾时也要把调用补出来。
+func TestWriteCallSynthesizedWhenDoneFrameMissing(t *testing.T) {
+	var data []byte
+	data = append(data, contentFrame("我这就去创建文件。")...)
+	data = append(data, progressFrame("call-w", toolWriteFile, "/tmp/a.py")...)
+	data = append(data, inputDeltaFrame("call-w", "print(1)\n")...)
+	data = append(data, conversationFrame(4)...)
+
+	body := &heldOpenBody{data: data, release: make(chan struct{})}
+	defer body.Close()
+	events := make(chan StreamEvent, 32)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go pumpAgentStream(ctx, body, events, "default")
+
+	var calls []NativeToolCall
+	var text string
+	for ev := range events {
+		switch ev.Kind {
+		case EventToolCall:
+			calls = append(calls, *ev.Tool)
+		case EventDelta:
+			text += ev.Text
+		}
+	}
+	if !strings.Contains(text, "我这就去创建") {
+		t.Fatalf("正文应保留，实际 %q", text)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("缺完成帧时应用流式内容补发写文件调用，实际 %d 次", len(calls))
+	}
+	c := calls[0]
+	if c.Kind != ToolWriteFile || c.Path != "/tmp/a.py" || c.Content != "print(1)\n" {
+		t.Fatalf("补发的调用不对：%+v", c)
 	}
 }
 
