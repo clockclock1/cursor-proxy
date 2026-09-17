@@ -1,0 +1,12 @@
+.git
+.github
+webui/node_modules
+webui/.vite
+dist/*
+!dist/
+!dist/cursor-proxy-linux-amd64
+!dist/cursor-proxy-linux-arm64
+.data
+*.log
+cursor-proxy
+cursor-proxy.exe
